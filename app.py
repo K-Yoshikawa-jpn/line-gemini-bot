@@ -69,9 +69,9 @@ def handle_message(event):
 
         ai_text = response.text
 
-    except Exception:
-
-        ai_text = "申し訳ありません。AIでエラーが発生しました。"
+    except Exception as e:
+    app.logger.exception("Gemini API error: %s", e)
+    ai_text = "申し訳ありません。AIでエラーが発生しました。"
 
     with ApiClient(configuration) as api_client:
 
