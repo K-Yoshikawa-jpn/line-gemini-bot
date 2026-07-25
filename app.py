@@ -63,7 +63,7 @@ def handle_message(event):
     try:
 
         response = client.models.generate_content(
-            model="gemini-2.0-flash",
+            model="gemini-3.6-flash",
             contents=user_message,
         )
 
