@@ -19,6 +19,7 @@ from google import genai
 
 app = Flask(__name__)
 
+
 # =========================================================
 # 環境変数
 # =========================================================
@@ -50,26 +51,33 @@ MODEL_NAME = "gemini-3.6-flash"
 # LINEユーザーごとのGeminiチャットセッション
 chat_sessions = {}
 
-# 同時アクセスによる辞書の競合を防ぐ
+# セッション辞書の競合防止
 chat_sessions_lock = threading.Lock()
 
 
 # =========================================================
-# LINEの送信元を識別する
+# 送信元・セッション管理
 # =========================================================
+
+def get_source_type(event):
+    """
+    LINEの送信元タイプを取得する。
+
+    user  : 1対1トーク
+    group : グループトーク
+    room  : 複数人トーク
+    """
+
+    return getattr(event.source, "type", None)
+
 
 def get_session_id(event):
     """
-    LINEの送信元から、会話を識別するためのIDを作成する。
+    会話履歴を保存するための識別IDを作る。
 
-    1対1トーク:
-        user:{user_id}
-
-    グループ:
-        group:{group_id}:user:{user_id}
-
-    複数人トーク:
-        room:{room_id}:user:{user_id}
+    グループでは
+    「グループID + ユーザーID」
+    ごとに別の会話履歴を持つ。
     """
 
     source = event.source
@@ -80,24 +88,21 @@ def get_session_id(event):
     room_id = getattr(source, "room_id", None)
 
     if source_type == "group" and group_id:
-        # グループ内でもユーザーごとに会話を分ける
         return f"group:{group_id}:user:{user_id or 'unknown'}"
 
     if source_type == "room" and room_id:
-        # 複数人トーク内でもユーザーごとに会話を分ける
         return f"room:{room_id}:user:{user_id or 'unknown'}"
 
     if user_id:
         return f"user:{user_id}"
 
-    # 通常はここには来ないが、安全のための予備ID
     return "unknown"
 
 
 def get_or_create_chat(session_id):
     """
-    セッションIDに対応するGeminiチャットを取得する。
-    なければ新しく作成する。
+    ユーザーに対応したGeminiチャットを取得する。
+    存在しなければ新規作成する。
     """
 
     with chat_sessions_lock:
@@ -112,11 +117,107 @@ def get_or_create_chat(session_id):
 
 def reset_chat(session_id):
     """
-    指定されたユーザーの会話履歴を削除する。
+    指定ユーザーの会話履歴を削除する。
     """
 
     with chat_sessions_lock:
         chat_sessions.pop(session_id, None)
+
+
+# =========================================================
+# メンション判定
+# =========================================================
+
+def is_bot_mentioned(event):
+    """
+    Bot自身がメンションされているか判定する。
+
+    1対1トークでは、メンションなしでも常にTrue。
+    グループ・複数人トークでは、Botへのメンション時だけTrue。
+    """
+
+    source_type = get_source_type(event)
+
+    # 1対1トークは常に反応
+    if source_type == "user":
+        return True
+
+    # グループ・複数人トークではメンションを確認
+    mention = getattr(event.message, "mention", None)
+
+    if mention is None:
+        return False
+
+    mentionees = getattr(mention, "mentionees", None)
+
+    if not mentionees:
+        return False
+
+    for mentionee in mentionees:
+
+        # Python SDKでは通常 is_self
+        is_self = getattr(mentionee, "is_self", False)
+
+        # SDKのバージョン差への予備対応
+        if not is_self:
+            is_self = getattr(mentionee, "isSelf", False)
+
+        if is_self:
+            return True
+
+    return False
+
+
+def remove_bot_mention(event):
+    """
+    メッセージからBotのメンション部分を削除する。
+
+    例：
+    「@AIボット 今日の予定は？」
+           ↓
+    「今日の予定は？」
+    """
+
+    text = event.message.text
+
+    mention = getattr(event.message, "mention", None)
+
+    if mention is None:
+        return text.strip()
+
+    mentionees = getattr(mention, "mentionees", None)
+
+    if not mentionees:
+        return text.strip()
+
+    ranges_to_remove = []
+
+    for mentionee in mentionees:
+
+        is_self = getattr(mentionee, "is_self", False)
+
+        if not is_self:
+            is_self = getattr(mentionee, "isSelf", False)
+
+        if not is_self:
+            continue
+
+        index = getattr(mentionee, "index", None)
+        length = getattr(mentionee, "length", None)
+
+        if index is not None and length is not None:
+            ranges_to_remove.append(
+                (index, index + length)
+            )
+
+    # 後ろ側から削除すれば文字位置がずれない
+    for start, end in sorted(
+        ranges_to_remove,
+        reverse=True,
+    ):
+        text = text[:start] + text[end:]
+
+    return text.strip()
 
 
 # =========================================================
@@ -141,7 +242,10 @@ def callback():
         abort(400)
 
     except Exception as e:
-        app.logger.exception("Webhook error: %s", e)
+        app.logger.exception(
+            "Webhook error: %s",
+            e,
+        )
         abort(500)
 
     return "OK"
@@ -154,19 +258,35 @@ def callback():
 @handler.add(MessageEvent, message=TextMessageContent)
 def handle_message(event):
 
-    user_message = event.message.text.strip()
+    # グループ・複数人トークで
+    # Botがメンションされていなければ何もしない
+    if not is_bot_mentioned(event):
+        app.logger.info(
+            "Bot was not mentioned. Message ignored."
+        )
+        return
+
+    # Botのメンション文字を削除
+    user_message = remove_bot_mention(event)
+
+    # 「@Bot」だけ送られた場合
+    if not user_message:
+        user_message = "何か手伝えることはありますか？"
+
     session_id = get_session_id(event)
 
     try:
 
-        # 「会話をリセット」などを送ると履歴を削除
-        if user_message.lower() in {
+        reset_commands = {
             "リセット",
             "会話をリセット",
             "履歴を削除",
             "/reset",
             "reset",
-        }:
+        }
+
+        if user_message.lower() in reset_commands:
+
             reset_chat(session_id)
 
             ai_text = (
@@ -175,10 +295,11 @@ def handle_message(event):
             )
 
         else:
-            # 同じLINEユーザーのチャットセッションを取得
+
+            # 同じユーザーのチャットセッションを取得
             chat = get_or_create_chat(session_id)
 
-            # 同じチャットへメッセージを追加
+            # 会話を継続
             response = chat.send_message(user_message)
 
             ai_text = response.text
@@ -187,6 +308,7 @@ def handle_message(event):
                 ai_text = "申し訳ありません。回答を生成できませんでした。"
 
     except Exception as e:
+
         app.logger.exception(
             "Gemini API error. session_id=%s error=%s",
             session_id,
@@ -211,6 +333,7 @@ def handle_message(event):
             )
 
     except Exception as e:
+
         app.logger.exception(
             "LINE reply error. session_id=%s error=%s",
             session_id,
@@ -219,7 +342,10 @@ def handle_message(event):
 
 
 if __name__ == "__main__":
-    port = int(os.environ.get("PORT", 10000))
+
+    port = int(
+        os.environ.get("PORT", 10000)
+    )
 
     app.run(
         host="0.0.0.0",
